@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GANN Square of Nine Calculator</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+  <div id="loader" style="display:none;">
+    <div class="spinner"></div>
+  </div>
+
+  <div class="page-wrapper">
+    <div class="page-transition">
+      <header class="main-header">
+        <a href="index.html" class="logo">GANN<span>Suite</span></a>
+        <button id="toggleTheme" title="Toggle Theme">
+          <span class="theme-icon">🌙</span>
+        </button>
+      </header>
+
+      <main class="container">
+        <a href="index.html" class="back-link">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" d="M15 8a.5.5 0 0 0-.5-.5H2.707l3.147-3.146a.5.5 0 1 0-.708-.708l-4 4a.5.5 0 0 0 0 .708l4 4a.5.5 0 0 0 .708-.708L2.707 8.5H14.5A.5.5 0 0 0 15 8z"/>
+          </svg>
+          Back to Tools
+        </a>
+        <h1>Square of Nine</h1>
+        <p class="header-description">Generate potential support and resistance levels based on a stock's closing price.</p>
+
+        <div class="gann-calculator-layout">
+          <aside class="controls-card">
+            <h2>Controls</h2>
+            <div class="input-group">
+              <label for="symbolInput">Stock Symbol (NSE)</label>
+              <div class="input-wrapper">
+                <input id="symbolInput" placeholder="e.g., RELIANCE" autocomplete="off" />
+                <span class="clear-button" title="Clear">×</span>
+              </div>
+              <ul id="suggestions" class="suggestions-list"></ul>
+            </div>
+            <div class="input-group">
+              <label for="daySelector">Select Closing Day</label>
+              <select id="daySelector">
+                <option value="0">Latest Close</option>
+                <option value="1">1 Day Ago</option>
+                <option value="2">2 Days Ago</option>
+                <option value="3">3 Days Ago</option>
+                <option value="4">4 Days Ago</option>
+                <option value="5">5 Days Ago</option>
+              </select>
+            </div>
+            <div class="input-group">
+              <label for="stepSelect">Step Size</label>
+              <select id="stepSelect">
+                <option value="0.25" selected>0.25</option>
+                <option value="0.125">0.125</option>
+              </select>
+            </div>
+            <button id="generateLevels" style="width: 100%;">Generate Levels</button>
+          </aside>
+
+          <section class="results-area">
+            <div id="stockInfo" style="display: none;">
+              <div class="price-display">
+                Base Price: <span id="currentPrice"></span>
+              </div>
+              <button id="viewOnTradingView" class="tradingview-button">
+                📈 View Full Chart
+              </button>
+            </div>
+            <table id="levelsTable"></table>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="blob"></div>
+  <div class="blob blob2"></div>
+  <script src="gann-square.js"></script>
+</body>
+</html>

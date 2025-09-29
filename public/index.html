@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GANN Calculator Suite</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+  <div class="page-wrapper">
+    <div class="page-transition">
+      <header class="main-header">
+        <a href="index.html" class="logo">GANN<span>Suite</span></a>
+        <button id="toggleTheme" title="Toggle Theme">
+          <span class="theme-icon">🌙</span>
+        </button>
+      </header>
+
+      <main class="container">
+        <h1>GANN Calculator Suite</h1>
+        <p class="header-description">A collection of powerful financial analysis tools based on the timeless theories of W. D. Gann.</p>
+
+        <div class="tools-grid">
+          <a href="gann-square.html" class="tool-card">
+            <h3>Square of Nine Calculator</h3>
+            <p>Calculate key support and resistance levels from a specific price point using Gann's Square of Nine method.</p>
+          </a>
+
+          <div class="calculator-card">
+            <h3>Basic Retracement Calculator</h3>
+            <p>Quickly find 1/3, 1/2, and 2/3 retracement levels between two price points.</p>
+            <div class="input-group" style="margin-top: 1.5rem;">
+              <label for="startPrice">Start Price:</label>
+              <input type="number" id="startPrice" placeholder="e.g., 100">
+            </div>
+            <div class="input-group">
+              <label for="endPrice">End Price:</label>
+              <input type="number" id="endPrice" placeholder="e.g., 150">
+            </div>
+            <button id="calculateRetracement">Calculate</button>
+            <table id="retracementTable" style="display: none;"></table>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="blob"></div>
+  <div class="blob blob2"></div>
+  <script src="main.js"></script>
+</body>
+</html>
