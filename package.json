@@ -4,7 +4,7 @@
     "dependencies": {
         "express": "^4.21.2",
         "moment-timezone": "^0.6.0",
-        "stock-nse-india": "^1.1.0"
+        "node-fetch": "^3.3.2"
     },
     "scripts": {
         "start": "node --max-http-header-size=32768 proxy.js"

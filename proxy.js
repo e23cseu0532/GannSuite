@@ -1,16 +1,13 @@
 import express from 'express';
-import { NseIndia } from 'stock-nse-india';
+import fetch from 'node-fetch';
 import moment from 'moment-timezone';
 
 const app = express();
 app.use(express.static('public'));
 
-// Initialize NSE India API
-const nseIndia = new NseIndia();
-
-// Cache with extended TTL
+// Simple cache
 const cache = new Map();
-const CACHE_TTL = 300000; // 5 minutes
+const CACHE_TTL = 120000; // 2 minutes
 
 function getCache(key) {
   const cached = cache.get(key);
@@ -24,22 +21,6 @@ function setCache(key, value) {
   cache.set(key, { value, timestamp: Date.now() });
 }
 
-// Rate limiting
-let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 3000; // 3 seconds
-
-async function rateLimit() {
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastRequestTime;
-  
-  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-    const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-  }
-  
-  lastRequestTime = Date.now();
-}
-
 app.get('/api/price', async (req, res) => {
   try {
     let symbol = req.query.symbol;
@@ -47,98 +28,75 @@ app.get('/api/price', async (req, res) => {
       return res.status(400).json({ error: 'Stock symbol is required' });
     }
     
-    // Remove .NS suffix if present
-    if (symbol.endsWith('.NS')) {
-      symbol = symbol.replace('.NS', '');
+    if (!symbol.endsWith('.NS')) {
+      symbol += '.NS';
     }
 
     const daysAgo = parseInt(req.query.daysAgo || '0', 10);
     const cacheKey = `${symbol}:${daysAgo}`;
 
-    // Check cache first
+    // Check cache
     const cached = getCache(cacheKey);
     if (cached !== null) {
       console.log(`Cache hit for ${cacheKey}`);
       return res.json({ previousClose: cached, stale: false });
     }
 
-    // Rate limit before making request
-    await rateLimit();
-
-    console.log(`Fetching data for ${symbol} from NSE India...`);
-
-    // Calculate date range for historical data
-    const endDate = new Date();
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - (daysAgo + 30)); // Get extra days for safety
-
-    const range = {
-      start: startDate,
-      end: endDate
-    };
-
-    // Fetch historical data from NSE
-    const historicalData = await nseIndia.getEquityHistoricalData(symbol, range);
+    // Fetch from Yahoo (using query1 which works better)
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=max`;
+    console.log(`Fetching from Yahoo: ${url}`);
     
-    // Check if data exists (data is in historicalData.data array)
-    if (!historicalData || !historicalData.data || historicalData.data.length === 0) {
-      console.error(`No data found for ${symbol}`);
-      return res.status(404).json({ error: 'No data available for symbol' });
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      console.error(`Yahoo API error: ${response.status} ${response.statusText}`);
+      return res.status(500).json({ error: 'Failed to fetch data from Yahoo Finance' });
     }
 
-    // The actual data is in historicalData.data array
-    const dataArray = historicalData.data;
+    const data = await response.json();
+    const result = data.chart?.result?.[0];
     
-    // Sort data by date (newest first)
-    dataArray.sort((a, b) => new Date(b.CH_TIMESTAMP) - new Date(a.CH_TIMESTAMP));
+    if (!result) {
+      console.error('No result from Yahoo');
+      return res.status(404).json({ error: 'No data for symbol: ' + symbol });
+    }
+
+    const closes = result.indicators?.quote?.[0]?.close;
+    const timestamps = result.timestamp;
+
+    if (!closes || !timestamps || closes.length === 0) {
+      console.error('No price data in response');
+      return res.status(404).json({ error: 'No price data available' });
+    }
 
     // Determine which close price to use
+    const lastTs = timestamps[timestamps.length - 1];
+    const lastDate = moment.unix(lastTs).tz('Asia/Kolkata');
     const now = moment().tz('Asia/Kolkata');
-    const latestDate = moment(dataArray[0].CH_TIMESTAMP).tz('Asia/Kolkata');
 
     let indexToUse;
     
-    // If latest data is from today and market hasn't closed, use previous day
-    if (latestDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) {
-      indexToUse = 1 + daysAgo;
+    // If last candle is today and market not closed yet, use previous day
+    if (lastDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) {
+      indexToUse = closes.length - 2 - daysAgo;
     } else {
-      indexToUse = daysAgo;
+      indexToUse = closes.length - 1 - daysAgo;
     }
 
-    if (indexToUse >= dataArray.length) {
+    if (indexToUse < 0 || closes[indexToUse] == null) {
       return res.status(404).json({ error: `Not enough history to get ${daysAgo} days ago` });
     }
 
-    const dataItem = dataArray[indexToUse];
-    const previousClose = parseFloat(dataItem.CH_CLOSING_PRICE);
-    
-    if (isNaN(previousClose)) {
-      console.error('Invalid closing price:', dataItem.CH_CLOSING_PRICE);
-      return res.status(500).json({ error: 'Unable to extract closing price from data' });
-    }
+    const previousClose = closes[indexToUse];
     
     // Cache the result
     setCache(cacheKey, previousClose);
-    console.log(`Successfully fetched and cached ${cacheKey}: ${previousClose} from date: ${dataItem.CH_TIMESTAMP}`);
+    console.log(`Successfully fetched and cached ${cacheKey}: ${previousClose}`);
 
     res.json({ previousClose, stale: false });
   } catch (error) {
     console.error('Fetch error:', error.message);
-    console.error('Error stack:', error.stack);
-    
-    // Check if we have stale cache to return
-    let symbol = req.query.symbol;
-    if (symbol && symbol.endsWith('.NS')) {
-      symbol = symbol.replace('.NS', '');
-    }
-    const cacheKey = `${symbol}:${req.query.daysAgo || '0'}`;
-    const staleCache = cache.get(cacheKey);
-    if (staleCache) {
-      console.log(`Returning stale cache for ${cacheKey} due to error`);
-      return res.json({ previousClose: staleCache.value, stale: true });
-    }
-    
-    res.status(500).json({ error: 'Failed to fetch stock data' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
