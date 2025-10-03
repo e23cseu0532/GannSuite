@@ -1,213 +1,262 @@
-import express from "express";
-import fetch from "node-fetch";
-import moment from "moment-timezone";
+// proxy.js (ESM)
+import express from 'express';
+import moment from 'moment-timezone';
+import axios from 'axios';
+import tough from 'tough-cookie';
+import { wrapper } from 'axios-cookiejar-support';
 
 const app = express();
-app.use(express.static("public"));
+app.use(express.static('public'));
 
-// --- New Yahoo Authentication Logic ---
+// ----- Config -----
+const USER_AGENTS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+];
+const pickUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
-let yahooAuth = {
-  cookie: null,
-  crumb: null,
-  lastUpdated: 0,
+const DEBUG_YF = process.env.DEBUG_YF === '1';
+const FRESH_TTL_MS = parseInt(process.env.FRESH_TTL_MS || '60000', 10);      // 60s
+const STALE_TTL_MS = parseInt(process.env.STALE_TTL_MS || '600000', 10);     // 10m
+const MIN_INTERVAL_MS = parseInt(process.env.MIN_INTERVAL_MS || '10000', 10); // 10s to avoid rate limits
+
+// ----- Axios + cookie jar (hosts) -----
+const jar = new tough.CookieJar();
+const baseHeaders = {
+  'User-Agent': pickUA(),
+  'Accept': 'application/json,text/plain,*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Connection': 'keep-alive',
 };
 
-// Cache the auth details for 30 minutes
-const CACHE_DURATION = 30 * 60 * 1000;
+const http2 = wrapper(axios.create({ baseURL: 'https://query2.finance.yahoo.com', jar, withCredentials: true, timeout: 15000, headers: { ...baseHeaders } }));
+const http1 = wrapper(axios.create({ baseURL: 'https://query1.finance.yahoo.com', jar, withCredentials: true, timeout: 15000, headers: { ...baseHeaders } }));
+const httpPage = wrapper(axios.create({ baseURL: 'https://finance.yahoo.com', jar, withCredentials: true, timeout: 15000, headers: { ...baseHeaders } }));
+const httpConsent = wrapper(axios.create({ baseURL: 'https://guce.yahoo.com', jar, withCredentials: true, timeout: 15000, headers: { ...baseHeaders } }));
 
-async function getYahooAuth() {
+// ----- Session and consent handling -----
+let sessionReadyAt = 0;
+const SESSION_TTL = 30 * 60 * 1000;
+let sessionPromise = null;
+
+async function ensureBaseSession() {
   const now = Date.now();
-  if (now - yahooAuth.lastUpdated < CACHE_DURATION && yahooAuth.cookie && yahooAuth.crumb) {
-    console.log("Using cached Yahoo auth details.");
-    return yahooAuth;
+  if (now - sessionReadyAt < SESSION_TTL) return;
+  if (!sessionPromise) {
+    sessionPromise = (async () => {
+      await http2.get('https://fc.yahoo.com', { headers: { 'User-Agent': http2.defaults.headers['User-Agent'], 'Accept-Language': 'en-US,en;q=0.9' }, timeout: 15000 });
+      sessionReadyAt = Date.now();
+      sessionPromise = null;
+      if (DEBUG_YF) console.log('[yf] base session seeded');
+    })().catch((e) => { sessionPromise = null; throw e; });
   }
-
-  console.log("Fetching new Yahoo auth details (cookie and crumb)...");
-  try {
-    // Step 1: Get the cookie by visiting a page that reliably sets cookies
-    const cookieResponse = await fetch("https://fc.yahoo.com", {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-      }
-    });
-
-    let setCookie = cookieResponse.headers.raw()['set-cookie'];
-    if (!setCookie || setCookie.length === 0) {
-      throw new Error("Failed to get set-cookie header from Yahoo.");
-    }
-
-    // Step 2: Parse and filter only essential cookies to avoid header overflow
-    // Include common Yahoo session cookies: A1, A1S, A3, B, GUC, etc.
-    let cookie = setCookie
-      .map(cookieStr => cookieStr.split(';')[0].trim())  // Take only the key=value part
-      .filter(c => c.startsWith('A1=') || c.startsWith('A1S=') || c.startsWith('A3=') || c.startsWith('B=') || c.startsWith('GUC=') || c.startsWith('GUCS=') || c.startsWith('cmp='))
-      .join('; ');
-
-    if (!cookie) {
-      throw new Error("No essential cookies found in set-cookie header.");
-    }
-
-    // Safeguard: If cookie string is too long, log and truncate (though filtering should prevent this)
-    if (cookie.length > 8000) {
-      console.warn(`Cookie string too long (${cookie.length} chars), truncating...`);
-      cookie = cookie.substring(0, 8000);
-    }
-
-    // Step 3: Get the crumb using the filtered cookie
-    const crumbResponse = await fetch("https://query2.finance.yahoo.com/v1/test/getcrumb", {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Cookie': cookie,
-      }
-    });
-
-    if (!crumbResponse.ok) {
-      throw new Error(`Crumb request failed with status ${crumbResponse.status}`);
-    }
-
-    const crumb = await crumbResponse.text();
-
-    if (!crumb || crumb.length === 0) {
-      throw new Error("Failed to extract crumb from Yahoo Finance.");
-    }
-
-    yahooAuth = {
-      cookie,
-      crumb,
-      lastUpdated: now,
-    };
-
-    console.log("Successfully fetched new Yahoo auth details.");
-    return yahooAuth;
-  } catch (error) {
-    console.error("Error getting Yahoo auth:", error.message, error.stack);
-    // Invalidate cache on failure
-    yahooAuth.lastUpdated = 0;
-    throw error; // Re-throw to be caught by the route handler
-  }
+  await sessionPromise;
 }
 
-async function fetchWithYahooAuth(url) {
-  const { cookie, crumb } = await getYahooAuth();
-  const finalUrl = `${url}&crumb=${encodeURIComponent(crumb)}`;
+const warmedSymbols = new Map();
+const WARM_TTL = 30 * 60 * 1000;
 
-  return fetch(finalUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-      'Cookie': cookie,
-    }
+async function warmSymbol(symbol) {
+  const ts = warmedSymbols.get(symbol);
+  if (ts && Date.now() - ts < WARM_TTL) return;
+  await ensureBaseSession();
+  const quoteResp = await httpPage.get(`/quote/${encodeURIComponent(symbol)}`, {
+    headers: { 'User-Agent': httpPage.defaults.headers['User-Agent'], 'Accept-Language': 'en-US,en;q=0.9' },
+    params: { guccounter: 1 },
+    timeout: 15000,
+    maxRedirects: 5,
   });
+  if (quoteResp.request.res.responseUrl.includes('guce.yahoo.com')) {
+    if (DEBUG_YF) console.log('[yf] Handling consent for', symbol);
+    await httpConsent.post('/consent', new URLSearchParams({
+      agree: 'agree',
+      consentUUID: 'default',
+      sessionId: 'default',
+    }), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+  }
+  warmedSymbols.set(symbol, Date.now());
+  if (DEBUG_YF) console.log('[yf] warmed symbol:', symbol);
 }
 
-// --- API Routes Updated to Use New Auth Logic ---
+// ----- Rate gate -----
+let lastCallAt = 0;
+async function rateGate() {
+  const now = Date.now();
+  const wait = Math.max(0, lastCallAt + MIN_INTERVAL_MS - now);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastCallAt = Date.now();
+}
 
-app.get("/api/price", async (req, res) => {
-  let symbol = req.query.symbol;
-  if (!symbol) {
-    return res.status(400).json({ error: "Stock symbol is required" });
-  }
-  if (!symbol.endsWith(".NS")) {
-    symbol += ".NS";
-  }
-  const daysAgo = parseInt(req.query.daysAgo || "0");
+// ----- Cache -----
+const cache = new Map();
+const setCache = (key, val) => cache.set(key, { val, ts: Date.now() });
+const getFresh = (key) => {
+  const rec = cache.get(key);
+  return rec && (Date.now() - rec.ts <= FRESH_TTL_MS) ? rec.val : null;
+};
+const getStale = (key) => {
+  const rec = cache.get(key);
+  return rec && (Date.now() - rec.ts <= STALE_TTL_MS) ? rec.val : null;
+};
 
+// ----- Yahoo request with fallback -----
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const jitter = base => Math.floor(base * (0.8 + Math.random() * 0.4));
+
+async function tryClient(client, path, params, refererSymbol, label, maxRetries = 5) {
+  let attempt = 0;
+  while (true) {
+    try {
+      const resp = await client.get(path, {
+        params,
+        headers: refererSymbol ? { Referer: `https://finance.yahoo.com/quote/${encodeURIComponent(refererSymbol)}/` } : undefined,
+        validateStatus: () => true,
+      });
+      const ctype = String(resp.headers['content-type'] || '');
+      if (ctype.includes('text/html') || typeof resp.data === 'string') throw new Error('Interstitial');
+      if (resp.status >= 200 && resp.status < 300) return resp.data;
+      const status = resp.status;
+      if ((status === 429 || status === 403 || (status >= 500 && status < 600)) && attempt < maxRetries) {
+        attempt++;
+        if (status === 429 && attempt === 1) client.defaults.headers['User-Agent'] = pickUA();
+        const backoff = jitter(2000 * 2 ** (attempt - 1)); // Longer backoff
+        if (DEBUG_YF) console.warn(`[yf] ${label} ${path} ${status}, retry ${attempt} in ${backoff}ms`);
+        await sleep(backoff);
+        continue;
+      }
+      throw new Error(`Status ${status}`);
+    } catch (err) {
+      const status = err.response?.status || 500;
+      if ((status === 429 || status === 403 || (status >= 500 && status < 600)) && attempt < maxRetries) {
+        attempt++;
+        if (status === 429 && attempt === 1) client.defaults.headers['User-Agent'] = pickUA();
+        const backoff = jitter(2000 * 2 ** (attempt - 1));
+        if (DEBUG_YF) console.warn(`[yf] ${label} ${path} ${status ?? 'ERR'}, retry ${attempt} in ${backoff}ms`);
+        await sleep(backoff);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function yahooGetWithFallback(path, params, options) {
+  await rateGate();
+  let data = await tryClient(http2, path, params, options.refererSymbol, 'q2');
+  const isEmpty = d => !d || (d.quoteResponse && d.quoteResponse.result?.length === 0) || (d.chart && d.chart.result?.length === 0) || (d.quoteSummary && d.quoteSummary.result?.length === 0);
+  if (!isEmpty(data)) return data;
+  data = await tryClient(http1, path, params, options.refererSymbol, 'q1');
+  return data;
+}
+
+// Helpers
+async function yahooQuote(symbol) {
+  await ensureBaseSession();
+  await warmSymbol(symbol);
+  return yahooGetWithFallback('/v7/finance/quote', { symbols: symbol, region: 'IN', lang: 'en-IN' }, { refererSymbol: symbol });
+}
+
+async function yahooQuoteSummary(symbol) {
+  await ensureBaseSession();
+  await warmSymbol(symbol);
+  return yahooGetWithFallback('/v10/finance/quoteSummary', { symbol, modules: 'price', region: 'IN', lang: 'en-IN' }, { refererSymbol: symbol });
+}
+
+async function yahooChart(symbol, params) {
+  await ensureBaseSession();
+  await warmSymbol(symbol);
+  return yahooGetWithFallback(`/v8/finance/chart/${encodeURIComponent(symbol)}`, { ...params, region: 'IN', lang: 'en-IN' }, { refererSymbol: symbol });
+}
+
+// Backup scraper fallback (using your ScraperAPI key for structured Yahoo data)
+async function backupPreviousClose(symbol) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=10d`;
-    const response = await fetchWithYahooAuth(url);
+    const resp = await axios.get(`https://api.scraperapi.com/structured/yahoo/quote?api_key=7da16db721b77d7b57cf053549527d12&symbol=${symbol}`);
+    if (DEBUG_YF) console.log('[yf] Backup response:', resp.data);
+    return resp.data.previousClose;
+  } catch (e) {
+    if (DEBUG_YF) console.error('[yf] Backup error:', e.message);
+    throw new Error('Backup failed');
+  }
+}
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`Yahoo API Error for ${symbol}:`, response.status, errorText);
-      return res.status(response.status).json({ error: `Failed to fetch data from Yahoo Finance: ${response.statusText}` });
-    }
+// ----- Routes -----
+app.get('/api/price', async (req, res) => {
+  try {
+    let symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ error: 'Stock symbol is required' });
+    if (!symbol.endsWith('.NS')) symbol += '.NS';
 
-    const data = await response.json();
+    const daysAgo = parseInt(String(req.query.daysAgo || '0'), 10);
+    const key = `price:${symbol}:d:${daysAgo}`;
 
-    const result = data.chart?.result?.[0];
-    if (!result) {
-      return res.status(404).json({ error: "No data for symbol: " + symbol });
-    }
+    const fresh = getFresh(key);
+    if (fresh != null) return res.json({ previousClose: fresh, stale: false });
 
-    const closes = result.indicators?.quote?.[0]?.close;
-    const timestamps = result.timestamp;
+    let previousClose;
+    let usedBackup = false;
 
-    if (!closes || !timestamps || closes.length === 0) {
-      return res.status(404).json({ error: "No price data available" });
-    }
-
-    const lastTs = timestamps[timestamps.length - 1];
-    const lastDate = moment.unix(lastTs).tz("Asia/Kolkata");
-    const now = moment().tz("Asia/Kolkata");
-
-    let indexToUse;
-
-    if (
-      lastDate.isSame(now, "day") &&
-      (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))
-    ) {
-      indexToUse = closes.length - 2 - daysAgo;
+    if (daysAgo === 0) {
+      try {
+        const qd = await yahooQuote(symbol);
+        const q = qd?.quoteResponse?.result?.[0];
+        if (q && q.regularMarketPreviousClose != null) {
+          previousClose = q.regularMarketPreviousClose;
+        } else {
+          const sd = await yahooQuoteSummary(symbol);
+          const s = sd?.quoteSummary?.result?.[0]?.price;
+          if (s && (s.regularMarketPreviousClose?.raw ?? s.regularMarketPreviousClose) != null) {
+            previousClose = s.regularMarketPreviousClose.raw ?? s.regularMarketPreviousClose;
+          } else {
+            const c = await yahooChart(symbol, { interval: '1d', range: '10d' });
+            const r = c?.chart?.result?.[0];
+            const closes = r?.indicators?.quote?.[0]?.close;
+            const timestamps = r?.timestamp;
+            if (!r || !closes || !timestamps || !closes.length) throw new Error('No data');
+            const lastTs = timestamps[timestamps.length - 1];
+            const lastDate = moment.unix(lastTs).tz('Asia/Kolkata');
+            const now = moment().tz('Asia/Kolkata');
+            const idx = (lastDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) ? closes.length - 2 : closes.length - 1;
+            if (idx < 0 || closes[idx] == null) throw new Error('No data');
+            previousClose = closes[idx];
+          }
+        }
+      } catch (e) {
+        if (DEBUG_YF) console.error('[yf] Yahoo failed, trying backup:', e.message);
+        try {
+          previousClose = await backupPreviousClose(symbol);
+          usedBackup = true;
+        } catch (be) {
+          const stale = getStale(key);
+          if (stale != null) return res.json({ previousClose: stale, stale: true });
+          return res.status(500).json({ error: 'Upstream error and backup failed' });
+        }
+      }
     } else {
-      indexToUse = closes.length - 1 - daysAgo;
+      try {
+        const c = await yahooChart(symbol, { interval: '1d', range: 'max' });
+        const r = c?.chart?.result?.[0];
+        const closes = r?.indicators?.quote?.[0]?.close;
+        const timestamps = r?.timestamp;
+        if (!r || !closes || !timestamps || !closes.length) throw new Error('No data');
+        const idx = closes.length - 1 - daysAgo;
+        if (idx < 0 || closes[idx] == null) throw new Error('Not enough history');
+        previousClose = closes[idx];
+      } catch (e) {
+        const stale = getStale(key);
+        if (stale != null) return res.json({ previousClose: stale, stale: true });
+        return res.status(500).json({ error: 'Upstream error' });
+      }
     }
 
-    if (indexToUse < 0 || closes[indexToUse] == null) {
-      return res.status(404).json({ error: `Not enough history to get ${daysAgo} days ago.` });
-    }
-
-    const previousClose = closes[indexToUse];
-
-    res.json({ previousClose });
-  } catch (error) {
-    console.error(`Fetch error for ${symbol}:`, error.message, error.stack);
-    res.status(500).json({ error: `Internal server error: ${error.message}` });  // Include error message for debugging
-  }
-});
-
-app.get("/api/yahoo-chart", async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) {
-    return res.status(400).json({ error: "Stock symbol is required" });
-  }
-
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`;
-    const response = await fetchWithYahooAuth(url);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`Yahoo API Error for ${symbol}:`, response.status, errorText);
-      return res.status(response.status).json({ error: `Failed to fetch data from Yahoo Finance: ${response.statusText}` });
-    }
-
-    const data = await response.json();
-
-    const result = data.chart?.result?.[0];
-    if (!result) {
-      return res.status(404).json({ error: "No data for symbol: " + symbol });
-    }
-
-    const meta = result.meta;
-    const closes = result.indicators?.quote?.[0]?.close;
-    const timestamps = result.timestamp;
-
-    if (!closes || closes.length === 0 || !timestamps) {
-      return res.status(404).json({ error: "No price data available" });
-    }
-
-    const latestClose = closes[closes.length - 1];
-
-    res.json({
-      meta,
-      closes,
-      timestamps,
-      latestClose,
-    });
+    setCache(key, previousClose);
+    res.json({ previousClose, stale: false, usedBackup });
   } catch (err) {
-    console.error(`Yahoo fetch error for ${symbol}:`, err.message, err.stack);
-    res.status(500).json({ error: `Internal server error: ${err.message}` });  // Include error message for debugging
+    if (DEBUG_YF) console.error('[yf] Internal error:', err.message);
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
-const PORT = 3005;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+const PORT = process.env.PORT || 3005;
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
