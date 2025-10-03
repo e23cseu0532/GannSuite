@@ -80,9 +80,7 @@ app.get('/api/price', async (req, res) => {
     // Fetch historical data from NSE
     const historicalData = await nseIndia.getEquityHistoricalData(symbol, range);
     
-    // DEBUG: Log the raw response to see structure
-    console.log('Raw API response:', JSON.stringify(historicalData, null, 2));
-    
+    // Check if data exists (data is in historicalData.data array)
     if (!historicalData || !historicalData.data || historicalData.data.length === 0) {
       console.error(`No data found for ${symbol}`);
       return res.status(404).json({ error: 'No data available for symbol' });
@@ -93,9 +91,6 @@ app.get('/api/price', async (req, res) => {
     
     // Sort data by date (newest first)
     dataArray.sort((a, b) => new Date(b.CH_TIMESTAMP) - new Date(a.CH_TIMESTAMP));
-
-    // DEBUG: Log first item to see field names
-    console.log('First data item:', JSON.stringify(dataArray[0], null, 2));
 
     // Determine which close price to use
     const now = moment().tz('Asia/Kolkata');
@@ -114,25 +109,17 @@ app.get('/api/price', async (req, res) => {
       return res.status(404).json({ error: `Not enough history to get ${daysAgo} days ago` });
     }
 
-    // Try different possible field names for closing price
     const dataItem = dataArray[indexToUse];
-    let previousClose = 
-      parseFloat(dataItem.CH_CLOSING_PRICE) || 
-      parseFloat(dataItem.CLOSE_PRICE) || 
-      parseFloat(dataItem.close) || 
-      parseFloat(dataItem.CH_TRADE_HIGH_PRICE) ||
-      parseFloat(dataItem.CH_LAST_TRADED_PRICE);
-    
-    console.log(`Extracted close price: ${previousClose} from item:`, dataItem);
+    const previousClose = parseFloat(dataItem.CH_CLOSING_PRICE);
     
     if (isNaN(previousClose)) {
-      console.error('Could not find valid closing price in data item:', dataItem);
+      console.error('Invalid closing price:', dataItem.CH_CLOSING_PRICE);
       return res.status(500).json({ error: 'Unable to extract closing price from data' });
     }
     
     // Cache the result
     setCache(cacheKey, previousClose);
-    console.log(`Successfully fetched and cached ${cacheKey}: ${previousClose}`);
+    console.log(`Successfully fetched and cached ${cacheKey}: ${previousClose} from date: ${dataItem.CH_TIMESTAMP}`);
 
     res.json({ previousClose, stale: false });
   } catch (error) {
@@ -140,7 +127,11 @@ app.get('/api/price', async (req, res) => {
     console.error('Error stack:', error.stack);
     
     // Check if we have stale cache to return
-    const cacheKey = `${req.query.symbol}:${req.query.daysAgo || '0'}`;
+    let symbol = req.query.symbol;
+    if (symbol && symbol.endsWith('.NS')) {
+      symbol = symbol.replace('.NS', '');
+    }
+    const cacheKey = `${symbol}:${req.query.daysAgo || '0'}`;
     const staleCache = cache.get(cacheKey);
     if (staleCache) {
       console.log(`Returning stale cache for ${cacheKey} due to error`);
