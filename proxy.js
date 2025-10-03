@@ -5,9 +5,12 @@ import moment from 'moment-timezone';
 const app = express();
 app.use(express.static('public'));
 
-// Simple cache
+// ScraperAPI key (you already have this)
+const SCRAPER_API_KEY = '7da16db721b77d7b57cf053549527d12';
+
+// Cache
 const cache = new Map();
-const CACHE_TTL = 120000; // 2 minutes
+const CACHE_TTL = 180000; // 3 minutes
 
 function getCache(key) {
   const cached = cache.get(key);
@@ -42,15 +45,17 @@ app.get('/api/price', async (req, res) => {
       return res.json({ previousClose: cached, stale: false });
     }
 
-    // Fetch from Yahoo (using query1 which works better)
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=max`;
-    console.log(`Fetching from Yahoo: ${url}`);
+    // Use ScraperAPI to proxy Yahoo Finance request
+    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=max`;
+    const scraperUrl = `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(yahooUrl)}`;
     
-    const response = await fetch(url);
+    console.log(`Fetching ${symbol} via ScraperAPI...`);
+    
+    const response = await fetch(scraperUrl);
     
     if (!response.ok) {
-      console.error(`Yahoo API error: ${response.status} ${response.statusText}`);
-      return res.status(500).json({ error: 'Failed to fetch data from Yahoo Finance' });
+      console.error(`ScraperAPI error: ${response.status}`);
+      return res.status(500).json({ error: 'Failed to fetch data' });
     }
 
     const data = await response.json();
@@ -58,25 +63,23 @@ app.get('/api/price', async (req, res) => {
     
     if (!result) {
       console.error('No result from Yahoo');
-      return res.status(404).json({ error: 'No data for symbol: ' + symbol });
+      return res.status(404).json({ error: 'No data for symbol' });
     }
 
     const closes = result.indicators?.quote?.[0]?.close;
     const timestamps = result.timestamp;
 
     if (!closes || !timestamps || closes.length === 0) {
-      console.error('No price data in response');
+      console.error('No price data');
       return res.status(404).json({ error: 'No price data available' });
     }
 
-    // Determine which close price to use
+    // Determine which close to use
     const lastTs = timestamps[timestamps.length - 1];
     const lastDate = moment.unix(lastTs).tz('Asia/Kolkata');
     const now = moment().tz('Asia/Kolkata');
 
     let indexToUse;
-    
-    // If last candle is today and market not closed yet, use previous day
     if (lastDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) {
       indexToUse = closes.length - 2 - daysAgo;
     } else {
@@ -84,14 +87,13 @@ app.get('/api/price', async (req, res) => {
     }
 
     if (indexToUse < 0 || closes[indexToUse] == null) {
-      return res.status(404).json({ error: `Not enough history to get ${daysAgo} days ago` });
+      return res.status(404).json({ error: `Not enough history` });
     }
 
     const previousClose = closes[indexToUse];
     
-    // Cache the result
     setCache(cacheKey, previousClose);
-    console.log(`Successfully fetched and cached ${cacheKey}: ${previousClose}`);
+    console.log(`Successfully cached ${cacheKey}: ${previousClose}`);
 
     res.json({ previousClose, stale: false });
   } catch (error) {
