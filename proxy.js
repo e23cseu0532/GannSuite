@@ -1,13 +1,16 @@
 import express from 'express';
-import fetch from 'node-fetch';
+import { NseIndia } from 'stock-nse-india';
 import moment from 'moment-timezone';
 
 const app = express();
 app.use(express.static('public'));
 
-// Cache with TTL
+// Initialize NSE India API
+const nseIndia = new NseIndia();
+
+// Cache with extended TTL
 const cache = new Map();
-const CACHE_TTL = 120000; // 2 minutes (cache results longer)
+const CACHE_TTL = 300000; // 5 minutes
 
 function getCache(key) {
   const cached = cache.get(key);
@@ -21,9 +24,9 @@ function setCache(key, value) {
   cache.set(key, { value, timestamp: Date.now() });
 }
 
-// Rate limiting - minimum 2 seconds between requests
+// Rate limiting
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 2000; // 2 seconds
+const MIN_REQUEST_INTERVAL = 3000; // 3 seconds
 
 async function rateLimit() {
   const now = Date.now();
@@ -37,19 +40,6 @@ async function rateLimit() {
   lastRequestTime = Date.now();
 }
 
-// User-Agent rotation
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
-];
-
-function getRandomUserAgent() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
 app.get('/api/price', async (req, res) => {
   try {
     let symbol = req.query.symbol;
@@ -57,8 +47,9 @@ app.get('/api/price', async (req, res) => {
       return res.status(400).json({ error: 'Stock symbol is required' });
     }
     
-    if (!symbol.endsWith('.NS')) {
-      symbol += '.NS';
+    // Remove .NS suffix if present
+    if (symbol.endsWith('.NS')) {
+      symbol = symbol.replace('.NS', '');
     }
 
     const daysAgo = parseInt(req.query.daysAgo || '0', 10);
@@ -74,66 +65,47 @@ app.get('/api/price', async (req, res) => {
     // Rate limit before making request
     await rateLimit();
 
-    // Fetch from Yahoo with User-Agent
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=max`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': getRandomUserAgent(),
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://finance.yahoo.com/',
-        'Origin': 'https://finance.yahoo.com'
-      }
-    });
+    console.log(`Fetching data for ${symbol} from NSE India...`);
+
+    // Calculate date range for historical data
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - (daysAgo + 30)); // Get extra days for safety
+
+    const range = {
+      start: startDate,
+      end: endDate
+    };
+
+    // Fetch historical data from NSE
+    const historicalData = await nseIndia.getEquityHistoricalData(symbol, range);
     
-    if (!response.ok) {
-      console.error(`Yahoo API error: ${response.status} ${response.statusText}`);
-      
-      // If rate limited, return cached value if available (even if stale)
-      if (response.status === 429) {
-        const staleCache = cache.get(cacheKey);
-        if (staleCache) {
-          console.log(`Returning stale cache due to rate limit for ${cacheKey}`);
-          return res.json({ previousClose: staleCache.value, stale: true });
-        }
-      }
-      
-      return res.status(500).json({ error: 'Failed to fetch data from Yahoo Finance' });
+    if (!historicalData || historicalData.length === 0) {
+      console.error(`No data found for ${symbol}`);
+      return res.status(404).json({ error: 'No data available for symbol' });
     }
 
-    const data = await response.json();
-    const result = data.chart?.result?.[0];
-    
-    if (!result) {
-      return res.status(404).json({ error: 'No data for symbol: ' + symbol });
-    }
-
-    const closes = result.indicators?.quote?.[0]?.close;
-    const timestamps = result.timestamp;
-
-    if (!closes || !timestamps || closes.length === 0) {
-      return res.status(404).json({ error: 'No price data available' });
-    }
+    // Sort data by date (newest first)
+    historicalData.sort((a, b) => new Date(b.CH_TIMESTAMP) - new Date(a.CH_TIMESTAMP));
 
     // Determine which close price to use
-    const lastTs = timestamps[timestamps.length - 1];
-    const lastDate = moment.unix(lastTs).tz('Asia/Kolkata');
     const now = moment().tz('Asia/Kolkata');
+    const latestDate = moment(historicalData[0].CH_TIMESTAMP).tz('Asia/Kolkata');
 
     let indexToUse;
     
-    // If last candle is today and market not closed yet, use previous day
-    if (lastDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) {
-      indexToUse = closes.length - 2 - daysAgo;
+    // If latest data is from today and market hasn't closed, use previous day
+    if (latestDate.isSame(now, 'day') && (now.hour() < 15 || (now.hour() === 15 && now.minute() < 30))) {
+      indexToUse = 1 + daysAgo;
     } else {
-      indexToUse = closes.length - 1 - daysAgo;
+      indexToUse = daysAgo;
     }
 
-    if (indexToUse < 0 || closes[indexToUse] == null) {
+    if (indexToUse >= historicalData.length) {
       return res.status(404).json({ error: `Not enough history to get ${daysAgo} days ago` });
     }
 
-    const previousClose = closes[indexToUse];
+    const previousClose = parseFloat(historicalData[indexToUse].CH_CLOSING_PRICE);
     
     // Cache the result
     setCache(cacheKey, previousClose);
@@ -142,7 +114,16 @@ app.get('/api/price', async (req, res) => {
     res.json({ previousClose, stale: false });
   } catch (error) {
     console.error('Fetch error:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
+    
+    // Check if we have stale cache to return
+    const cacheKey = `${req.query.symbol}:${req.query.daysAgo || '0'}`;
+    const staleCache = cache.get(cacheKey);
+    if (staleCache) {
+      console.log(`Returning stale cache for ${cacheKey} due to error`);
+      return res.json({ previousClose: staleCache.value, stale: true });
+    }
+    
+    res.status(500).json({ error: 'Failed to fetch stock data' });
   }
 });
 
